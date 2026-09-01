@@ -12,6 +12,7 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.auth import verify_api_key
+from app.schemas import ConvertResponse, HealthResponse, ResultResponse
 from app.services.markitdown_service import prepare_upload, process_document
 from app.services.metrics import (
     document_processing_seconds,
@@ -26,7 +27,7 @@ from app.services.redis_service import get_markdown, get_status, save_markdown, 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Middleware de métricas HTTP (ESC-10)
+# Middleware de métricas HTTP
 # ---------------------------------------------------------------------------
 
 
@@ -36,7 +37,6 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         duration = time.perf_counter() - start
 
-        # Normaliza path para evitar cardinalidade infinita (ex.: /result/{id})
         path = request.url.path
         if path.startswith("/result/"):
             path = "/result/{doc_id}"
@@ -58,11 +58,33 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 # App
 # ---------------------------------------------------------------------------
 
+_TAGS = [
+    {
+        "name": "Conversão",
+        "description": "Envio de documentos e recuperação do Markdown gerado.",
+    },
+    {
+        "name": "Observabilidade",
+        "description": "Health check e métricas de monitoramento.",
+    },
+]
+
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="MarkItDown API",
     version="2.0.0",
-    description="Converte documentos (PDF, DOCX, PPTX, XLSX, XLS) para Markdown com suporte a OCR.",
+    description=(
+        "Converte documentos (**PDF, DOCX, PPTX, XLSX, XLS**) para Markdown.\n\n"
+        "PDFs são processados página por página: páginas com texto nativo usam "
+        "**MarkItDown**, páginas escaneadas usam **PaddleOCR** automaticamente.\n\n"
+        "O processamento ocorre em background — `POST /convert` retorna imediatamente "
+        "e o resultado é recuperado via `GET /result/{id}`.\n\n"
+        "### Autenticação\n"
+        "Todas as rotas (exceto `/health` e `/metrics`) exigem `?api_key=SUA_CHAVE`.\n\n"
+        "### Rate limit\n"
+        "10 requisições por minuto por IP. Excedido o limite, o IP é bloqueado por 1 minuto."
+    ),
+    openapi_tags=_TAGS,
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -70,16 +92,11 @@ app.add_middleware(PrometheusMiddleware)
 
 
 # ---------------------------------------------------------------------------
-# Background task (ESC-01, ESC-02, ESC-05, ESC-06, ESC-10)
+# Background task
 # ---------------------------------------------------------------------------
 
 
 async def _process_and_store(doc_id: str, temp_path: str, ext: str) -> None:
-    """
-    Executa em background: converte o documento e persiste no Redis.
-    Garante remoção do arquivo temporário em qualquer cenário (ESC-06).
-    Instrumenta métricas de duração e documentos em progresso (ESC-10).
-    """
     documents_in_progress.inc()
     start = time.perf_counter()
     try:
@@ -108,29 +125,58 @@ async def _process_and_store(doc_id: str, temp_path: str, ext: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["Observabilidade"],
+    summary="Health check",
+    response_model=HealthResponse,
+)
 async def health_check():
+    """Verifica se a API está online e aceitando requisições."""
     return {"status": "ok"}
 
 
-@app.get("/metrics", response_class=PlainTextResponse, include_in_schema=False)
+@app.get(
+    "/metrics",
+    tags=["Observabilidade"],
+    summary="Métricas Prometheus",
+    response_class=PlainTextResponse,
+    include_in_schema=False,
+)
 async def metrics():
     """Endpoint de scraping para o Prometheus. Não requer autenticação."""
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post("/convert", status_code=202)
+@app.post(
+    "/convert",
+    tags=["Conversão"],
+    summary="Enviar documento para conversão",
+    response_model=ConvertResponse,
+    status_code=202,
+    responses={
+        400: {"description": "Formato de arquivo inválido ou conteúdo não corresponde à extensão."},
+        401: {"description": "API Key não informada."},
+        403: {"description": "API Key inválida."},
+        413: {"description": "Arquivo maior que 500 MB."},
+        429: {"description": "Rate limit atingido. Tente novamente em 1 minuto."},
+    },
+)
 @limiter.limit("10/minute")
 async def convert(
     request: Request,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: UploadFile = File(..., description="Arquivo a converter. Formatos aceitos: .pdf, .docx, .pptx, .xlsx, .xls"),
     _: str = Depends(verify_api_key),
 ):
     """
-    Recebe o arquivo, valida e enfileira processamento em background.
-    Retorna imediatamente com o ID e status "processing".
-    Use GET /result/{id} para acompanhar o resultado.
+    Envia um documento para conversão assíncrona.
+
+    O arquivo é validado (extensão + MIME type real) e lido antes de retornar.
+    A conversão em si ocorre em background — use `GET /result/{id}` para
+    acompanhar o andamento e recuperar o Markdown quando concluído.
+
+    **Limite:** 500 MB por arquivo · 10 requisições/min por IP.
     """
     temp_path, ext = await prepare_upload(file)
 
@@ -143,7 +189,19 @@ async def convert(
     return {"id": doc_id, "status": "processing"}
 
 
-@app.get("/result/{doc_id}")
+@app.get(
+    "/result/{doc_id}",
+    tags=["Conversão"],
+    summary="Recuperar resultado da conversão",
+    response_model=ResultResponse,
+    responses={
+        200: {"description": "Status atual do documento (processing, done ou error)."},
+        401: {"description": "API Key não informada."},
+        403: {"description": "API Key inválida."},
+        404: {"description": "ID não encontrado ou resultado expirado (TTL esgotado)."},
+        429: {"description": "Rate limit atingido. Tente novamente em 1 minuto."},
+    },
+)
 @limiter.limit("10/minute")
 async def get_result(
     request: Request,
@@ -151,11 +209,16 @@ async def get_result(
     _: str = Depends(verify_api_key),
 ):
     """
-    Retorna o resultado da conversão.
-    - status "processing" → ainda em andamento.
-    - status "done"       → markdown disponível no campo "markdown".
-    - status "error"      → falha no processamento.
-    - 404                 → ID inexistente ou expirado (TTL esgotado).
+    Retorna o status e, quando concluído, o Markdown do documento.
+
+    | `status`      | Significado |
+    |---------------|-------------|
+    | `processing`  | Conversão em andamento — consulte novamente em instantes. |
+    | `done`        | Concluído — campo `markdown` disponível. |
+    | `error`       | Falha no processamento — campo `detail` com a mensagem. |
+
+    O resultado expira conforme a variável `REDIS_TTL` (padrão: 24h).
+    Após expirado, retorna `404`.
     """
     status = await get_status(doc_id)
 
@@ -168,7 +231,6 @@ async def get_result(
     if status == "error":
         return {"id": doc_id, "status": "error", "detail": "Falha ao processar o documento."}
 
-    # status == "done"
     markdown = await get_markdown(doc_id)
     if markdown is None:
         raise HTTPException(status_code=404, detail="Documento não encontrado ou expirado.")
