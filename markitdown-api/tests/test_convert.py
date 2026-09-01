@@ -12,19 +12,22 @@ client = TestClient(app)
 
 DUMMY_PDF = b"%PDF-1.4 fake pdf content"
 
+# Chave raw de teste — deve bater com o hash em api_keys.py
+VALID_API_KEY = "nJHU7QG6PuD8qwwkvWO0KgDLH7FUcltPu9L3a0mwJJQ"
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Reseta o estado do rate limiter antes de cada teste para evitar interferência."""
+    from app.main import limiter
+    limiter._storage.reset()
+    yield
+
 
 def _md_result(text: str) -> MagicMock:
     result = MagicMock()
     result.text_content = text
     return result
-
-
-def _mock_redis(save_ok=True, stored_value: str | None = None):
-    """Retorna patches para save_markdown e get_markdown."""
-    return (
-        patch("app.main.save_markdown", new_callable=AsyncMock),
-        patch("app.main.get_markdown", new_callable=AsyncMock, return_value=stored_value),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +42,55 @@ def test_health():
 
 
 # ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_retorna_429_apos_10_requisicoes():
+    """Após 10 requisições no mesmo minuto, o IP deve ser bloqueado com 429."""
+    with patch("app.main.save_markdown", new_callable=AsyncMock), \
+         patch("app.services.markitdown_service.process_pdf", return_value="texto"):
+        for _ in range(10):
+            r = client.post(
+                f"/convert?api_key={VALID_API_KEY}",
+                files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
+            )
+            assert r.status_code == 202
+
+        blocked = client.post(
+            f"/convert?api_key={VALID_API_KEY}",
+            files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
+        )
+        assert blocked.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Autenticação
+# ---------------------------------------------------------------------------
+
+
+def test_sem_api_key_retorna_401():
+    response = client.post(
+        "/convert",
+        files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
+    )
+    assert response.status_code == 401
+
+
+def test_api_key_invalida_retorna_403():
+    response = client.post(
+        "/convert?api_key=chave-errada",
+        files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
+    )
+    assert response.status_code == 403
+
+
+def test_get_result_sem_api_key_retorna_401():
+    response = client.get("/result/qualquer-id")
+    assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # POST /convert — grava no Redis, devolve ID
 # ---------------------------------------------------------------------------
 
@@ -50,7 +102,7 @@ def test_convert_pdf_retorna_id():
         mock_process.return_value = "Texto do documento."
 
         response = client.post(
-            "/convert",
+            f"/convert?api_key={VALID_API_KEY}",
             files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
         )
 
@@ -67,7 +119,7 @@ def test_convert_pdf_escaneado_retorna_id():
         mock_process.return_value = "Texto extraído via OCR."
 
         response = client.post(
-            "/convert",
+            f"/convert?api_key={VALID_API_KEY}",
             files={"file": ("scan.pdf", DUMMY_PDF, "application/pdf")},
         )
 
@@ -77,7 +129,7 @@ def test_convert_pdf_escaneado_retorna_id():
 
 def test_convert_formato_invalido_retorna_400():
     response = client.post(
-        "/convert",
+        f"/convert?api_key={VALID_API_KEY}",
         files={"file": ("img.jpg", b"fake", "image/jpeg")},
     )
     assert response.status_code == 400
@@ -89,7 +141,7 @@ def test_convert_erro_interno_retorna_500():
         mock_process.side_effect = Exception("falha")
 
         response = client.post(
-            "/convert",
+            f"/convert?api_key={VALID_API_KEY}",
             files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
         )
         assert response.status_code == 500
@@ -104,7 +156,7 @@ def test_get_result_encontrado():
     texto = "Conteúdo markdown armazenado."
 
     with patch("app.main.get_markdown", new_callable=AsyncMock, return_value=texto):
-        response = client.get("/result/meu-id-qualquer")
+        response = client.get(f"/result/meu-id-qualquer?api_key={VALID_API_KEY}")
 
     assert response.status_code == 200
     body = response.json()
@@ -114,7 +166,7 @@ def test_get_result_encontrado():
 
 def test_get_result_nao_encontrado_retorna_404():
     with patch("app.main.get_markdown", new_callable=AsyncMock, return_value=None):
-        response = client.get("/result/id-inexistente")
+        response = client.get(f"/result/id-inexistente?api_key={VALID_API_KEY}")
 
     assert response.status_code == 404
     assert "não encontrado" in response.json()["detail"].lower()
@@ -137,14 +189,14 @@ def test_fluxo_completo_convert_e_recupera():
     with patch("app.main.save_markdown", side_effect=fake_save), \
          patch("app.services.markitdown_service.process_pdf", return_value=texto):
         r1 = client.post(
-            "/convert",
+            f"/convert?api_key={VALID_API_KEY}",
             files={"file": ("portaria.pdf", DUMMY_PDF, "application/pdf")},
         )
         assert r1.status_code == 202
         doc_id = r1.json()["id"]
 
     with patch("app.main.get_markdown", new_callable=AsyncMock, return_value=texto):
-        r2 = client.get(f"/result/{doc_id}")
+        r2 = client.get(f"/result/{doc_id}?api_key={VALID_API_KEY}")
         assert r2.status_code == 200
         assert r2.json()["markdown"] == texto
         assert r2.json()["id"] == doc_id
@@ -161,13 +213,13 @@ def test_pdf_preserva_caracteres_portugueses():
     with patch("app.main.save_markdown", new_callable=AsyncMock), \
          patch("app.services.markitdown_service.process_pdf", return_value=texto_pt):
         r1 = client.post(
-            "/convert",
+            f"/convert?api_key={VALID_API_KEY}",
             files={"file": ("portaria.pdf", DUMMY_PDF, "application/pdf")},
         )
         doc_id = r1.json()["id"]
 
     with patch("app.main.get_markdown", new_callable=AsyncMock, return_value=texto_pt):
-        r2 = client.get(f"/result/{doc_id}")
+        r2 = client.get(f"/result/{doc_id}?api_key={VALID_API_KEY}")
         body = r2.json()["markdown"]
         assert "nº" in body
         assert "ã" in body

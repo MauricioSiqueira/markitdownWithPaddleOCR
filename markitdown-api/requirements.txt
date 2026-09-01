@@ -3,6 +3,7 @@ uvicorn
 python-multipart
 markitdown[pptx,docx,xlsx,xls,pdf]
 redis[asyncio]>=5.0.0
+slowapi>=0.1.9
 
 # OCR
 numpy<2.0

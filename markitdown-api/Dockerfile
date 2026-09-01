@@ -44,6 +44,10 @@ RUN python -c "import scipy, scipy.ndimage; from paddleocr import PaddleOCR; Pad
 
 COPY ./app ./app
 
+# Cria usuário não-root e transfere ownership dos arquivos da aplicação
+RUN useradd -m -u 1001 appuser && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
