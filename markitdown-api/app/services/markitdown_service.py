@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 
+import magic
 from fastapi import HTTPException, UploadFile
 from markitdown import MarkItDown
 
@@ -21,6 +22,21 @@ _md = MarkItDown(enable_plugins=False)
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+# MIME types permitidos por extensão — validados pelo python-magic
+_ALLOWED_MIMES: dict[str, set[str]] = {
+    ".pdf":  {"application/pdf"},
+    ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    ".pptx": {"application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+    ".xlsx": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    ".xls":  {"application/vnd.ms-excel"},
+}
+
+
+def _validate_mime(ext: str, content: bytes) -> bool:
+    """Detecta o MIME type real do conteúdo via python-magic e valida contra o esperado."""
+    detected = magic.from_buffer(content[:2048], mime=True)
+    return detected in _ALLOWED_MIMES.get(ext, set())
 
 
 async def convert_file_to_markdown(file: UploadFile) -> str:
@@ -41,6 +57,12 @@ async def convert_file_to_markdown(file: UploadFile) -> str:
             raise HTTPException(
                 status_code=400,
                 detail="O arquivo excedeu o limite de tamanho permitido (50 MB).",
+            )
+
+        if not _validate_mime(ext, content):
+            raise HTTPException(
+                status_code=400,
+                detail="O conteúdo do arquivo não corresponde ao formato declarado.",
             )
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:

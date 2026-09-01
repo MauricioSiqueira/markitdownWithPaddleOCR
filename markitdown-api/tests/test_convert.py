@@ -136,6 +136,29 @@ def test_convert_formato_invalido_retorna_400():
     assert "Formato não suportado" in response.json()["detail"]
 
 
+def test_arquivo_com_extensao_valida_mas_conteudo_invalido_retorna_400():
+    """Arquivo com extensão .pdf mas conteúdo falso deve ser rejeitado pelo python-magic."""
+    with patch("app.services.markitdown_service._validate_mime", return_value=False):
+        response = client.post(
+            f"/convert?api_key={VALID_API_KEY}",
+            files={"file": ("malicioso.pdf", b"isto nao e um pdf", "application/pdf")},
+        )
+    assert response.status_code == 400
+    assert "não corresponde" in response.json()["detail"]
+
+
+def test_arquivo_com_mime_valido_e_aceito():
+    """Arquivo com MIME type correto detectado pelo python-magic deve passar."""
+    with patch("app.main.save_markdown", new_callable=AsyncMock), \
+         patch("app.services.markitdown_service.process_pdf", return_value="texto"), \
+         patch("app.services.markitdown_service._validate_mime", return_value=True):
+        response = client.post(
+            f"/convert?api_key={VALID_API_KEY}",
+            files={"file": ("doc.pdf", b"%PDF-1.4 conteudo fake", "application/pdf")},
+        )
+    assert response.status_code == 202
+
+
 def test_convert_erro_interno_retorna_500():
     with patch("app.services.markitdown_service.process_pdf") as mock_process:
         mock_process.side_effect = Exception("falha")
