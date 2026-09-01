@@ -1,0 +1,69 @@
+name: Deploy em Produção (Build & Push Docker Image to GHCR)
+
+on:
+  workflow_dispatch:
+#  push:
+#    branches:
+#      - main
+
+env:
+  IMAGE_NAME: markitdown-api
+
+jobs:
+  test:
+    name: Testes
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            fastapi uvicorn python-multipart \
+            markitdown \
+            pymupdf \
+            numpy \
+            opencv-python-headless \
+            redis \
+            httpx pytest pytest-mock
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  build-and-push:
+    name: Build & Push
+    runs-on: ubuntu-24.04
+    needs: test
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }} # Personal Access Token com permissão write:packages (https://github.com/settings/tokens)
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/somesoftware/markitdown-api:latest
+            ghcr.io/somesoftware/markitdown-api:${{ github.sha }}
