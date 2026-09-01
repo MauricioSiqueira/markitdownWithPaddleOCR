@@ -54,12 +54,19 @@ def process_pdf(pdf_path: str) -> str:
         logger.error("Erro ao abrir PDF %s: %s", pdf_path, exc)
         raise
 
-    page_count = len(doc)
+    total_pages = len(doc)
 
-    if page_count == 0:
+    if total_pages == 0:
         logger.warning("PDF não contém páginas: %s", pdf_path)
         doc.close()
         return ""
+
+    page_count = min(total_pages, settings.OCR_MAX_PAGES)
+    if total_pages > settings.OCR_MAX_PAGES:
+        logger.warning(
+            "PDF com %d páginas excede o limite de %d. Processando apenas as primeiras %d.",
+            total_pages, settings.OCR_MAX_PAGES, page_count,
+        )
 
     logger.info("PDF com %d página(s). Iniciando processamento por página.", page_count)
     page_results = []

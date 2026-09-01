@@ -81,7 +81,9 @@ def process_page_image(image_path: str) -> str:
         img_bgr = preprocess_for_ocr(img_bgr)
 
     ocr = _get_ocr()
-    result = ocr.ocr(img_bgr, cls=True)
+    # Lock garante inferência serial — PaddleOCR não é thread-safe (ESC-03)
+    with _ocr_lock:
+        result = ocr.ocr(img_bgr, cls=True)
 
     if not result or not result[0]:
         return ""

@@ -1,10 +1,13 @@
 """
 Serviço principal de conversão de documentos.
 
-Roteia o arquivo recebido:
-  - PDF  → pdf_processor.process_pdf (processamento página por página)
-  - Outros formatos (.docx, .pptx, .xlsx, .xls) → MarkItDown diretamente
+Divide responsabilidades em duas etapas:
+  1. prepare_upload()   — lê, valida e persiste o arquivo em disco (síncrona com o request)
+  2. process_document() — converte para Markdown em thread pool (executada em background)
+
+Formatos suportados: .pdf, .docx, .pptx, .xlsx, .xls
 """
+import asyncio
 import logging
 import os
 import tempfile
@@ -13,17 +16,18 @@ import magic
 from fastapi import HTTPException, UploadFile
 from markitdown import MarkItDown
 
+from app.config import settings
 from app.services.pdf_processor import process_pdf
 
 logger = logging.getLogger(__name__)
 
-# Instância reutilizável para formatos não-PDF
+# Instância compartilhada para formatos não-PDF (ESC-09)
 _md = MarkItDown(enable_plugins=False)
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls"}
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+CHUNK_SIZE = 1 * 1024 * 1024       # lê 1 MB por vez
 
-# MIME types permitidos por extensão — validados pelo python-magic
 _ALLOWED_MIMES: dict[str, set[str]] = {
     ".pdf":  {"application/pdf"},
     ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
@@ -34,12 +38,34 @@ _ALLOWED_MIMES: dict[str, set[str]] = {
 
 
 def _validate_mime(ext: str, content: bytes) -> bool:
-    """Detecta o MIME type real do conteúdo via python-magic e valida contra o esperado."""
     detected = magic.from_buffer(content[:2048], mime=True)
     return detected in _ALLOWED_MIMES.get(ext, set())
 
 
-async def convert_file_to_markdown(file: UploadFile) -> str:
+async def _read_chunked(file: UploadFile) -> bytes:
+    """Lê o arquivo em chunks de 1 MB, rejeitando imediatamente se exceder 500 MB."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="O arquivo excedeu o limite de tamanho permitido (500 MB).",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def prepare_upload(file: UploadFile) -> tuple[str, str]:
+    """
+    Valida e salva o arquivo em disco. Retorna (temp_path, ext).
+    Deve ser chamado dentro do contexto do request (antes de retornar a resposta).
+    O chamador é responsável por remover temp_path após o processamento.
+    """
     filename = file.filename or ""
     ext = os.path.splitext(filename)[1].lower()
 
@@ -49,46 +75,40 @@ async def convert_file_to_markdown(file: UploadFile) -> str:
             detail=f"Formato não suportado: {ext}. Formatos permitidos: {', '.join(ALLOWED_EXTENSIONS)}",
         )
 
-    temp_path = None
+    content = await _read_chunked(file)
+
+    if not _validate_mime(ext, content):
+        raise HTTPException(
+            status_code=400,
+            detail="O conteúdo do arquivo não corresponde ao formato declarado.",
+        )
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(content)
+        temp_path = tmp.name
+
+    safe_name = filename.replace("\n", "").replace("\r", "")[:255]
+    logger.info("Arquivo validado e salvo temporariamente: %s", safe_name)
+
+    return temp_path, ext
+
+
+async def process_document(temp_path: str, ext: str) -> str:
+    """
+    Converte o documento para Markdown em thread pool (não bloqueia o event loop).
+    Aplica timeout configurável via PROCESSING_TIMEOUT (padrão: 300s).
+    """
     try:
-        content = await file.read()
-
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail="O arquivo excedeu o limite de tamanho permitido (50 MB).",
-            )
-
-        if not _validate_mime(ext, content):
-            raise HTTPException(
-                status_code=400,
-                detail="O conteúdo do arquivo não corresponde ao formato declarado.",
-            )
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-            temp_file.write(content)
-            temp_path = temp_file.name
-
-        logger.info("Processando arquivo: %s", filename)
-
-        try:
+        async with asyncio.timeout(settings.PROCESSING_TIMEOUT):
             if ext == ".pdf":
-                return process_pdf(temp_path)
+                # ESC-01: process_pdf é CPU-bound → executa em thread pool
+                return await asyncio.to_thread(process_pdf, temp_path)
             else:
-                result = _md.convert(temp_path)
+                result = await asyncio.to_thread(_md.convert, temp_path)
                 return (result.text_content or "").strip()
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.error("Erro ao converter arquivo %s: %s", filename, exc)
-            raise HTTPException(
-                status_code=500,
-                detail="Ocorreu um erro interno ao processar a conversão do documento.",
-            )
-
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError as exc:
-                logger.error("Erro ao remover arquivo temporário %s: %s", temp_path, exc)
+    except TimeoutError:
+        logger.error("Timeout ao processar documento (limite: %ds)", settings.PROCESSING_TIMEOUT)
+        raise Exception(f"Timeout: processamento excedeu {settings.PROCESSING_TIMEOUT}s.")
+    except Exception as exc:
+        logger.error("Erro ao processar documento: %s", exc)
+        raise

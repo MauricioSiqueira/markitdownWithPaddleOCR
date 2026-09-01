@@ -13,5 +13,11 @@ class Settings:
     # TTL em segundos: padrão 24 horas
     REDIS_TTL: int = int(os.getenv("REDIS_TTL", "86400"))
 
+    # Limite de páginas processadas por documento (ESC-08)
+    OCR_MAX_PAGES: int = int(os.getenv("OCR_MAX_PAGES", "100"))
+
+    # Timeout em segundos para processamento de um documento (ESC-05)
+    PROCESSING_TIMEOUT: int = int(os.getenv("PROCESSING_TIMEOUT", "300"))
+
 
 settings = Settings()
