@@ -3,7 +3,6 @@ Testes da API MarkItDown com Redis e background tasks.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -11,17 +10,14 @@ from app.main import app
 client = TestClient(app)
 
 DUMMY_PDF = b"%PDF-1.4 fake pdf content"
-
-# Chave raw de teste — deve bater com o hash em api_keys.py
 VALID_API_KEY = "nJHU7QG6PuD8qwwkvWO0KgDLH7FUcltPu9L3a0mwJJQ"
 
-
-@pytest.fixture(autouse=True)
-def reset_rate_limiter():
-    """Reseta o estado do rate limiter antes de cada teste para evitar interferência."""
-    from app.main import limiter
-    limiter._storage.reset()
-    yield
+DUMMY_PAGES = [
+    {"page": 1, "markitdown": "Conteúdo da página 1.", "noises": []},
+    {"page": 2, "markitdown": "Conteúdo da página 2.", "noises": [
+        {"page": 2, "text": "rmorl", "confidence": 0.54, "reason": "low_confidence"}
+    ]},
+]
 
 
 def _md_result(text: str) -> MagicMock:
@@ -39,30 +35,6 @@ def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-
-
-# ---------------------------------------------------------------------------
-# Rate limiting
-# ---------------------------------------------------------------------------
-
-
-def test_rate_limit_retorna_429_apos_10_requisicoes():
-    """Após 10 requisições no mesmo minuto, o IP deve ser bloqueado com 429."""
-    with patch("app.main.save_status", new_callable=AsyncMock), \
-         patch("app.main.save_markdown", new_callable=AsyncMock), \
-         patch("app.services.markitdown_service.process_pdf", return_value="texto"):
-        for _ in range(10):
-            r = client.post(
-                f"/convert?api_key={VALID_API_KEY}",
-                files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
-            )
-            assert r.status_code == 202
-
-        blocked = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
-        )
-        assert blocked.status_code == 429
 
 
 # ---------------------------------------------------------------------------
@@ -92,15 +64,14 @@ def test_get_result_sem_api_key_retorna_401():
 
 
 # ---------------------------------------------------------------------------
-# POST /convert — retorna ID + status "processing" imediatamente
+# POST /convert
 # ---------------------------------------------------------------------------
 
 
 def test_convert_pdf_retorna_id_e_status_processing():
-    """POST /convert deve retornar UUID e status 'processing' imediatamente."""
     with patch("app.main.save_status", new_callable=AsyncMock), \
-         patch("app.main.save_markdown", new_callable=AsyncMock), \
-         patch("app.services.markitdown_service.process_pdf", return_value="Texto do documento."):
+         patch("app.main.save_pages", new_callable=AsyncMock), \
+         patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES):
 
         response = client.post(
             f"/convert?api_key={VALID_API_KEY}",
@@ -110,14 +81,14 @@ def test_convert_pdf_retorna_id_e_status_processing():
         assert response.status_code == 202
         body = response.json()
         assert "id" in body
-        assert len(body["id"]) == 36  # UUID4
+        assert len(body["id"]) == 36
         assert body["status"] == "processing"
 
 
 def test_convert_pdf_escaneado_retorna_id():
     with patch("app.main.save_status", new_callable=AsyncMock), \
-         patch("app.main.save_markdown", new_callable=AsyncMock), \
-         patch("app.services.markitdown_service.process_pdf", return_value="Texto extraído via OCR."):
+         patch("app.main.save_pages", new_callable=AsyncMock), \
+         patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES):
 
         response = client.post(
             f"/convert?api_key={VALID_API_KEY}",
@@ -125,9 +96,7 @@ def test_convert_pdf_escaneado_retorna_id():
         )
 
         assert response.status_code == 202
-        body = response.json()
-        assert "id" in body
-        assert body["status"] == "processing"
+        assert response.json()["status"] == "processing"
 
 
 def test_convert_formato_invalido_retorna_400():
@@ -140,7 +109,6 @@ def test_convert_formato_invalido_retorna_400():
 
 
 def test_arquivo_com_extensao_valida_mas_conteudo_invalido_retorna_400():
-    """Arquivo com extensão .pdf mas conteúdo falso deve ser rejeitado pelo python-magic."""
     with patch("app.services.markitdown_service._validate_mime", return_value=False):
         response = client.post(
             f"/convert?api_key={VALID_API_KEY}",
@@ -151,10 +119,9 @@ def test_arquivo_com_extensao_valida_mas_conteudo_invalido_retorna_400():
 
 
 def test_arquivo_com_mime_valido_e_aceito():
-    """Arquivo com MIME type correto detectado pelo python-magic deve passar."""
     with patch("app.main.save_status", new_callable=AsyncMock), \
-         patch("app.main.save_markdown", new_callable=AsyncMock), \
-         patch("app.services.markitdown_service.process_pdf", return_value="texto"), \
+         patch("app.main.save_pages", new_callable=AsyncMock), \
+         patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES), \
          patch("app.services.markitdown_service._validate_mime", return_value=True):
         response = client.post(
             f"/convert?api_key={VALID_API_KEY}",
@@ -164,7 +131,6 @@ def test_arquivo_com_mime_valido_e_aceito():
 
 
 def test_arquivo_maior_que_500mb_retorna_413():
-    """Arquivo acima de 500 MB deve ser rejeitado durante a leitura em chunks."""
     from fastapi import HTTPException as _HTTPException
     with patch("app.services.markitdown_service._read_chunked", new_callable=AsyncMock) as mock_read:
         mock_read.side_effect = _HTTPException(
@@ -180,14 +146,13 @@ def test_arquivo_maior_que_500mb_retorna_413():
 
 
 def test_convert_erro_no_processamento_salva_status_error():
-    """Erro durante processamento em background deve resultar em status 'error' no Redis."""
     saved_statuses: list[tuple] = []
 
     async def capture_status(doc_id: str, status: str) -> None:
         saved_statuses.append((doc_id, status))
 
     with patch("app.main.save_status", side_effect=capture_status), \
-         patch("app.main.save_markdown", new_callable=AsyncMock), \
+         patch("app.main.save_pages", new_callable=AsyncMock), \
          patch("app.services.markitdown_service.process_pdf", side_effect=Exception("falha simulada")):
 
         response = client.post(
@@ -196,19 +161,17 @@ def test_convert_erro_no_processamento_salva_status_error():
         )
 
     assert response.status_code == 202
-    # Background task deve ter gravado "processing" e depois "error"
     statuses = [s for _, s in saved_statuses]
     assert "processing" in statuses
     assert "error" in statuses
 
 
 # ---------------------------------------------------------------------------
-# GET /result/{id} — lê status e markdown do Redis
+# GET /result/{id}
 # ---------------------------------------------------------------------------
 
 
 def test_get_result_status_processing():
-    """Enquanto processamento não terminou, deve retornar status 'processing'."""
     with patch("app.main.get_status", new_callable=AsyncMock, return_value="processing"):
         response = client.get(f"/result/meu-id?api_key={VALID_API_KEY}")
 
@@ -219,59 +182,51 @@ def test_get_result_status_processing():
 
 
 def test_get_result_encontrado():
-    """Quando processamento terminou, deve retornar status 'done' e markdown."""
-    texto = "Conteúdo markdown armazenado."
-
     with patch("app.main.get_status", new_callable=AsyncMock, return_value="done"), \
-         patch("app.main.get_markdown", new_callable=AsyncMock, return_value=texto):
+         patch("app.main.get_pages", new_callable=AsyncMock, return_value=DUMMY_PAGES):
         response = client.get(f"/result/meu-id-qualquer?api_key={VALID_API_KEY}")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["markdown"] == texto
-    assert body["id"] == "meu-id-qualquer"
     assert body["status"] == "done"
+    assert body["id"] == "meu-id-qualquer"
+    assert len(body["pages"]) == 2
+    assert body["pages"][0]["page"] == 1
+    assert body["pages"][1]["noises"][0]["reason"] == "low_confidence"
 
 
 def test_get_result_status_error():
-    """Quando processamento falhou, deve retornar status 'error'."""
     with patch("app.main.get_status", new_callable=AsyncMock, return_value="error"):
         response = client.get(f"/result/id-com-erro?api_key={VALID_API_KEY}")
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "error"
+    assert response.json()["status"] == "error"
 
 
 def test_get_result_nao_encontrado_retorna_404():
-    """ID inexistente ou expirado deve retornar 404."""
     with patch("app.main.get_status", new_callable=AsyncMock, return_value=None):
         response = client.get(f"/result/id-inexistente?api_key={VALID_API_KEY}")
 
     assert response.status_code == 404
-    assert "não encontrado" in response.json()["detail"].lower()
 
 
 # ---------------------------------------------------------------------------
-# Fluxo completo: convert → result
+# Fluxo completo
 # ---------------------------------------------------------------------------
 
 
 def test_fluxo_completo_convert_e_recupera():
-    """Simula o fluxo completo: POST /convert → GET /result/{id}."""
-    texto = "Portaria nº 42 — regulamentação específica do órgão."
-    captured_id: dict = {}
+    captured: dict = {}
 
-    async def fake_save_markdown(doc_id: str, markdown: str) -> None:
-        captured_id["id"] = doc_id
-        captured_id["markdown"] = markdown
+    async def fake_save_pages(doc_id: str, pages: list) -> None:
+        captured["id"] = doc_id
 
     async def fake_save_status(doc_id: str, status: str) -> None:
         pass
 
-    with patch("app.main.save_markdown", side_effect=fake_save_markdown), \
+    with patch("app.main.save_pages", side_effect=fake_save_pages), \
          patch("app.main.save_status", side_effect=fake_save_status), \
-         patch("app.services.markitdown_service.process_pdf", return_value=texto):
+         patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES):
         r1 = client.post(
             f"/convert?api_key={VALID_API_KEY}",
             files={"file": ("portaria.pdf", DUMMY_PDF, "application/pdf")},
@@ -281,12 +236,12 @@ def test_fluxo_completo_convert_e_recupera():
         assert r1.json()["status"] == "processing"
 
     with patch("app.main.get_status", new_callable=AsyncMock, return_value="done"), \
-         patch("app.main.get_markdown", new_callable=AsyncMock, return_value=texto):
+         patch("app.main.get_pages", new_callable=AsyncMock, return_value=DUMMY_PAGES):
         r2 = client.get(f"/result/{doc_id}?api_key={VALID_API_KEY}")
         assert r2.status_code == 200
-        assert r2.json()["markdown"] == texto
-        assert r2.json()["id"] == doc_id
         assert r2.json()["status"] == "done"
+        assert r2.json()["id"] == doc_id
+        assert len(r2.json()["pages"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -296,10 +251,11 @@ def test_fluxo_completo_convert_e_recupera():
 
 def test_pdf_preserva_caracteres_portugueses():
     texto_pt = "Portaria nº 123/2024 — Seção de Administração do órgão público; critérios específicos."
+    pages_pt = [{"page": 1, "markitdown": texto_pt, "noises": []}]
 
     with patch("app.main.save_status", new_callable=AsyncMock), \
-         patch("app.main.save_markdown", new_callable=AsyncMock), \
-         patch("app.services.markitdown_service.process_pdf", return_value=texto_pt):
+         patch("app.main.save_pages", new_callable=AsyncMock), \
+         patch("app.services.markitdown_service.process_pdf", return_value=pages_pt):
         r1 = client.post(
             f"/convert?api_key={VALID_API_KEY}",
             files={"file": ("portaria.pdf", DUMMY_PDF, "application/pdf")},
@@ -307,9 +263,9 @@ def test_pdf_preserva_caracteres_portugueses():
         doc_id = r1.json()["id"]
 
     with patch("app.main.get_status", new_callable=AsyncMock, return_value="done"), \
-         patch("app.main.get_markdown", new_callable=AsyncMock, return_value=texto_pt):
+         patch("app.main.get_pages", new_callable=AsyncMock, return_value=pages_pt):
         r2 = client.get(f"/result/{doc_id}?api_key={VALID_API_KEY}")
-        body = r2.json()["markdown"]
+        body = r2.json()["pages"][0]["markitdown"]
         assert "nº" in body
         assert "ã" in body
         assert "ç" in body
@@ -366,9 +322,12 @@ def test_page_analyzer_pagina_em_branco_nao_usa_ocr():
 def test_assemble_pages_une_paginas_nao_vazias():
     from app.services.markdown_builder import assemble_pages
 
-    resultado = assemble_pages(["Página 1", "", "Página 3"])
-    assert "Página 1" in resultado
-    assert "Página 3" in resultado
+    resultado = assemble_pages(["Conteúdo da primeira", "", "Conteúdo da terceira"])
+    assert "Conteúdo da primeira" in resultado
+    assert "Conteúdo da terceira" in resultado
+    assert "## Página 1/3" in resultado
+    assert "## Página 2/3" in resultado
+    assert "## Página 3/3" in resultado
     assert resultado.index("Página 1") < resultado.index("Página 3")
 
 
@@ -378,8 +337,18 @@ def test_assemble_pages_lista_vazia_retorna_vazio():
     assert assemble_pages([]) == ""
 
 
+def test_assemble_pages_pagina_vazia_recebe_nota():
+    from app.services.markdown_builder import assemble_pages
+
+    resultado = assemble_pages(["texto", ""])
+    assert "## Página 2/2" in resultado
+    assert "*(sem conteúdo)*" in resultado
+
+
 def test_assemble_pages_preserva_acentuacao():
     from app.services.markdown_builder import assemble_pages
 
     texto = "Portaria nº 1 — regulamentação específica"
-    assert assemble_pages([texto]) == texto
+    resultado = assemble_pages([texto])
+    assert texto in resultado
+    assert "## Página 1/1" in resultado

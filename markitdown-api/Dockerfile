@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1
 # Configuração padrão do OCR (sobreposta via docker run -e ou docker-compose)
 ENV OCR_ENABLED=true
 ENV OCR_LANGUAGE=pt
-ENV OCR_DPI=300
+ENV OCR_DPI=400
 ENV OCR_MIN_TEXT_LENGTH=30
 ENV OCR_MIN_IMAGE_RATIO=0.10
 ENV OCR_PREPROCESSING=true
@@ -38,16 +38,16 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
     pip install --no-cache-dir --no-binary pyclipper pyclipper && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pré-baixa os modelos do PaddleOCR durante o build para evitar download em runtime.
-# scipy é importado primeiro para garantir que seus Cython extensions sejam carregados
-# antes do paddle carregar sua libz bundled (evita zlib.error -2 em arm64).
-RUN python -c "import scipy, scipy.ndimage; from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='pt', show_log=False)"
-
 COPY ./app ./app
 
 # Cria usuário não-root e transfere ownership dos arquivos da aplicação
 RUN useradd -m -u 1001 appuser && chown -R appuser:appuser /app
 USER appuser
+
+# Pré-baixa os modelos do PaddleOCR como appuser — os modelos ficam em
+# /home/appuser/.paddleocr/, que é exatamente onde o runtime vai procurar.
+# scipy é importado primeiro para garantir a ordem correta de carregamento do zlib.
+RUN python -c "import scipy, scipy.ndimage; from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='pt', show_log=False)"
 
 EXPOSE 8000
 

@@ -19,9 +19,9 @@ import fitz  # PyMuPDF
 from markitdown import MarkItDown
 
 from app.config import settings
-from app.services.markdown_builder import assemble_pages
 from app.services.ocr_service import process_page_image
 from app.services.page_analyzer import should_use_ocr
+from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +34,16 @@ _md_pdf = MarkItDown(enable_plugins=False)
 # ---------------------------------------------------------------------------
 
 
-def process_pdf(pdf_path: str) -> str:
+def process_pdf(pdf_path: str) -> List[Dict[str, Any]]:
     """
-    Processa um arquivo PDF página por página e retorna Markdown.
-
-    Args:
-        pdf_path: caminho para o PDF no disco.
+    Processa um arquivo PDF página por página.
 
     Returns:
-        Texto Markdown com o conteúdo completo do documento.
+        Lista de dicts, um por página:
+        [{"page": 1, "markitdown": "...", "noises": [...]}, ...]
 
     Raises:
-        Exception: propaga erros de abertura do PDF; erros individuais de página
+        Exception: propaga erros de abertura do PDF; erros de página individual
                    são registrados mas não interrompem o processamento.
     """
     try:
@@ -69,12 +67,13 @@ def process_pdf(pdf_path: str) -> str:
         )
 
     logger.info("PDF com %d página(s). Iniciando processamento por página.", page_count)
-    page_results = []
+    pages: List[Dict[str, Any]] = []
 
     try:
         for page_num in range(page_count):
             page = doc[page_num]
-            label = f"Página {page_num + 1}/{page_count}"
+            page_number = page_num + 1
+            label = f"Página {page_number}/{page_count}"
 
             use_ocr = settings.OCR_ENABLED and should_use_ocr(
                 page,
@@ -84,17 +83,18 @@ def process_pdf(pdf_path: str) -> str:
 
             if use_ocr:
                 logger.info("%s → OCR (PaddleOCR)", label)
-                text = _process_page_with_ocr(page, page_num)
+                text, noises = _process_page_with_ocr(page, page_num)
             else:
                 logger.info("%s → texto nativo (MarkItDown)", label)
                 text = _process_page_with_markitdown(doc, page_num)
+                noises = []
 
-            page_results.append(text)
+            pages.append({"page": page_number, "markitdown": text, "noises": noises})
 
     finally:
         doc.close()
 
-    return assemble_pages(page_results)
+    return pages
 
 
 # ---------------------------------------------------------------------------
@@ -145,12 +145,13 @@ def _process_page_with_markitdown(doc: fitz.Document, page_num: int) -> str:
                 logger.error("Erro ao remover PDF temporário %s: %s", temp_path, exc)
 
 
-def _process_page_with_ocr(page: fitz.Page, page_num: int) -> str:
+def _process_page_with_ocr(page: fitz.Page, page_num: int) -> Tuple[str, List[Dict]]:
     """
     Renderiza a página em alta resolução e executa PaddleOCR.
 
-    A resolução é controlada pela variável de ambiente OCR_DPI (padrão: 300).
+    A resolução é controlada pela variável de ambiente OCR_DPI (padrão: 400).
     A imagem temporária é removida imediatamente após o OCR.
+    Retorna (texto, noise_items).
     """
     img_temp_path = None
     try:
@@ -164,11 +165,11 @@ def _process_page_with_ocr(page: fitz.Page, page_num: int) -> str:
 
         del pix  # libera memória antes do OCR
 
-        return process_page_image(img_temp_path)
+        return process_page_image(img_temp_path, page_num=page_num + 1)
 
     except Exception as exc:
         logger.error("Erro ao processar página %d com OCR: %s", page_num + 1, exc)
-        return ""
+        return "", []
     finally:
         if img_temp_path and os.path.exists(img_temp_path):
             try:

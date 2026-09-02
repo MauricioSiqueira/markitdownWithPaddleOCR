@@ -18,19 +18,30 @@ def assemble_pages(page_results: List[str]) -> str:
     """
     Recebe os textos de cada página (na ordem correta) e monta o documento final.
 
-    Páginas em branco são ignoradas na concatenação, mas a ordem das demais
-    é sempre preservada.
+    Cada página não vazia é precedida por um cabeçalho `---\\n## Página N`
+    que permite correlacionar o conteúdo com os itens de `ocr_noise`
+    (que também carregam o número da página).
+
+    Páginas em branco recebem o cabeçalho com nota "(sem conteúdo)" para
+    que a numeração fique contínua e rastreável.
     """
     if not page_results:
         return ""
 
-    cleaned = [_clean_page_text(text) for text in page_results]
-    non_empty = [p for p in cleaned if p.strip()]
+    total = len(page_results)
+    sections: List[str] = []
 
-    if not non_empty:
-        return ""
+    for i, text in enumerate(page_results):
+        page_num = i + 1
+        cleaned = _clean_page_text(text)
+        header = f"---\n## Página {page_num}/{total}"
 
-    return "\n\n".join(non_empty)
+        if cleaned.strip():
+            sections.append(f"{header}\n\n{cleaned}")
+        else:
+            sections.append(f"{header}\n\n*(sem conteúdo)*")
+
+    return "\n\n".join(sections)
 
 
 def _clean_page_text(text: str) -> str:

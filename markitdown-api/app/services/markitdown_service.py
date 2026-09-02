@@ -93,19 +93,23 @@ async def prepare_upload(file: UploadFile) -> tuple[str, str]:
     return temp_path, ext
 
 
-async def process_document(temp_path: str, ext: str) -> str:
+async def process_document(temp_path: str, ext: str) -> list:
     """
     Converte o documento para Markdown em thread pool (não bloqueia o event loop).
     Aplica timeout configurável via PROCESSING_TIMEOUT (padrão: 300s).
+
+    Returns:
+        Lista de dicts por página: [{"page": 1, "markitdown": "...", "noises": [...]}, ...]
+        Formatos não-PDF retornam lista com uma única entrada (page=1, noises=[]).
     """
     try:
         async with asyncio.timeout(settings.PROCESSING_TIMEOUT):
             if ext == ".pdf":
-                # ESC-01: process_pdf é CPU-bound → executa em thread pool
                 return await asyncio.to_thread(process_pdf, temp_path)
             else:
                 result = await asyncio.to_thread(_md.convert, temp_path)
-                return (result.text_content or "").strip()
+                text = (result.text_content or "").strip()
+                return [{"page": 1, "markitdown": text, "noises": []}]
     except TimeoutError:
         logger.error("Timeout ao processar documento (limite: %ds)", settings.PROCESSING_TIMEOUT)
         raise Exception(f"Timeout: processamento excedeu {settings.PROCESSING_TIMEOUT}s.")

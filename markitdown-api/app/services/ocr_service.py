@@ -4,6 +4,7 @@ Serviço de OCR usando PaddleOCR.
 Responsabilidades:
   - Singleton thread-safe do PaddleOCR (carregado uma única vez por processo).
   - Execução do OCR em uma imagem de página (arquivo PNG/JPEG).
+  - Coleta de tokens de baixa confiança e padrões garbage para métricas de acertividade.
   - Reconstrução do layout: agrupa tokens em linhas e parágrafos, preservando
     a ordem de leitura (top → bottom, left → right) e detectando colunas básicas.
 
@@ -15,8 +16,9 @@ NOTA SOBRE IMPORTAÇÃO:
   garantindo a ordem correta sem penalizar o tempo de startup da aplicação.
 """
 import logging
+import re
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 
@@ -26,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 _ocr_lock = threading.Lock()
 _ocr: Optional[object] = None
+
+# Detecta strings compostas apenas por caracteres não alfanuméricos (ex: "@#$|///")
+_GARBAGE_RE = re.compile(r'^[^a-zA-ZÀ-ÿ0-9\s]{2,}$')
 
 
 # ---------------------------------------------------------------------------
@@ -60,22 +65,24 @@ def _get_ocr():
 # ---------------------------------------------------------------------------
 
 
-def process_page_image(image_path: str) -> str:
+def process_page_image(image_path: str, page_num: int = 0) -> Tuple[str, List[Dict]]:
     """
-    Executa OCR em uma imagem de página e retorna o texto com layout reconstruído.
+    Executa OCR em uma imagem de página e retorna (texto, itens_de_ruído).
 
     Args:
         image_path: caminho para o arquivo PNG/JPEG da página renderizada.
+        page_num: número da página (1-based), incluído nos registros de ruído.
 
     Returns:
-        Texto extraído com parágrafos e ordem de leitura preservados.
+        Tupla (texto_extraído, lista_de_ruído).
+        Cada item de ruído: {"page": int, "text": str, "confidence": float, "reason": str}
     """
     from app.services.image_preprocessor import preprocess_for_ocr
 
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
         logger.error("Não foi possível carregar imagem: %s", image_path)
-        return ""
+        return "", []
 
     if settings.OCR_PREPROCESSING:
         img_bgr = preprocess_for_ocr(img_bgr)
@@ -86,9 +93,9 @@ def process_page_image(image_path: str) -> str:
         result = ocr.ocr(img_bgr, cls=True)
 
     if not result or not result[0]:
-        return ""
+        return "", []
 
-    return reconstruct_layout(result[0])
+    return reconstruct_layout(result[0], page_num=page_num)
 
 
 # ---------------------------------------------------------------------------
@@ -96,38 +103,27 @@ def process_page_image(image_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def reconstruct_layout(ocr_lines: List) -> str:
+def reconstruct_layout(ocr_lines: List, page_num: int = 0) -> Tuple[str, List[Dict]]:
     """
-    Reconstrói o layout de leitura a partir dos resultados brutos do PaddleOCR.
+    Reconstrói o layout de leitura e coleta tokens de baixa confiança/garbage.
 
     Formato de entrada (por linha detectada):
         [ [[x1,y1],[x2,y2],[x3,y3],[x4,y4]], (texto, confiança) ]
 
-    Pipeline:
-      1. Extrai blocos com posição e texto.
-      2. Calcula altura média (baseline para thresholds).
-      3. Agrupa em linhas horizontais.
-      4. Detecta colunas (se houver gap horizontal significativo entre blocos da mesma linha).
-      5. Agrupa linhas em parágrafos por gap vertical.
-      6. Monta texto final.
+    Returns:
+        (texto_reconstruído, lista_de_ruído)
     """
-    blocks = _extract_blocks(ocr_lines)
+    blocks, noise_items = _extract_blocks(ocr_lines, page_num=page_num)
     if not blocks:
-        return ""
+        return "", noise_items
 
     avg_height = _avg_height(blocks)
-
-    # Ordena por posição vertical
     blocks.sort(key=lambda b: b["y_center"])
-
     lines = _group_into_lines(blocks, avg_height)
-
-    # Detecta layout de colunas (se largura disponível sugere duas colunas)
     lines = _handle_columns(lines, avg_height)
-
     paragraphs = _group_into_paragraphs(lines, avg_height)
 
-    return _render_paragraphs(paragraphs)
+    return _render_paragraphs(paragraphs), noise_items
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +131,15 @@ def reconstruct_layout(ocr_lines: List) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _extract_blocks(ocr_lines: List) -> List[Dict]:
-    """Converte saída bruta do PaddleOCR em lista de dicts com posição e texto."""
-    blocks = []
+def _extract_blocks(ocr_lines: List, page_num: int = 0) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Converte saída bruta do PaddleOCR em blocos posicionais.
+    Separa tokens de baixa confiança e padrões garbage nos noise_items.
+    """
+    blocks: List[Dict] = []
+    noise_items: List[Dict] = []
+    threshold = settings.OCR_CONFIDENCE_THRESHOLD
+
     for item in ocr_lines:
         if not item or len(item) < 2 or not item[1]:
             continue
@@ -147,30 +149,52 @@ def _extract_blocks(ocr_lines: List) -> List[Dict]:
             continue
 
         text = text_info[0].strip()
+        confidence = float(text_info[1]) if len(text_info) > 1 else 1.0
+
         if not text:
             continue
+
+        # Classifica como ruído antes de adicionar ao layout
+        is_garbage = bool(_GARBAGE_RE.match(text))
+        is_low_conf = confidence < threshold
+
+        if is_garbage:
+            noise_items.append({
+                "page": page_num,
+                "text": text,
+                "confidence": round(confidence, 4),
+                "reason": "garbage_pattern",
+            })
+            continue  # não inclui no texto final
+
+        if is_low_conf:
+            noise_items.append({
+                "page": page_num,
+                "text": text,
+                "confidence": round(confidence, 4),
+                "reason": "low_confidence",
+            })
+            # inclui no texto mesmo assim, mas registra para métrica
 
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
         y_top = min(ys)
         y_bottom = max(ys)
 
-        blocks.append(
-            {
-                "text": text,
-                "x_left": min(xs),
-                "x_right": max(xs),
-                "y_top": y_top,
-                "y_bottom": y_bottom,
-                "y_center": (y_top + y_bottom) / 2,
-                "height": y_bottom - y_top,
-            }
-        )
-    return blocks
+        blocks.append({
+            "text": text,
+            "x_left": min(xs),
+            "x_right": max(xs),
+            "y_top": y_top,
+            "y_bottom": y_bottom,
+            "y_center": (y_top + y_bottom) / 2,
+            "height": y_bottom - y_top,
+        })
+
+    return blocks, noise_items
 
 
 def _avg_height(blocks: List[Dict]) -> float:
-    """Altura média dos blocos OCR (representa a altura de uma linha de texto)."""
     heights = [b["height"] for b in blocks if b["height"] > 0]
     if not heights:
         return 20.0
@@ -178,12 +202,6 @@ def _avg_height(blocks: List[Dict]) -> float:
 
 
 def _group_into_lines(blocks: List[Dict], avg_height: float) -> List[List[Dict]]:
-    """
-    Agrupa blocos na mesma faixa vertical (mesma linha de texto).
-
-    Threshold: blocos cujos centros Y diferem em menos de 60 % da altura
-    média são considerados parte da mesma linha.
-    """
     if not blocks:
         return []
 
@@ -204,17 +222,9 @@ def _group_into_lines(blocks: List[Dict], avg_height: float) -> List[List[Dict]]
 
 
 def _handle_columns(lines: List[List[Dict]], avg_height: float) -> List[List[Dict]]:
-    """
-    Detecta páginas com duas colunas e reordena as linhas para que a coluna
-    esquerda apareça integralmente antes da coluna direita.
-
-    Heurística: se a maioria das linhas tem um gap horizontal central
-    maior que 15 % da largura estimada da página, trata como duas colunas.
-    """
     if len(lines) < 4:
         return lines
 
-    # Estimativa da largura da página a partir dos extremos dos blocos
     all_x_right = [b["x_right"] for line in lines for b in line]
     all_x_left = [b["x_left"] for line in lines for b in line]
     if not all_x_right or not all_x_left:
@@ -225,8 +235,6 @@ def _handle_columns(lines: List[List[Dict]], avg_height: float) -> List[List[Dic
         return lines
 
     col_gap_threshold = page_width * 0.15
-
-    # Conta linhas com gap central grande (duas colunas separadas)
     two_col_count = 0
     for line in lines:
         if len(line) < 2:
@@ -237,14 +245,11 @@ def _handle_columns(lines: List[List[Dict]], avg_height: float) -> List[List[Dic
                 two_col_count += 1
                 break
 
-    # Se > 40 % das linhas com múltiplos blocos têm gap central → duas colunas
     multi_block_lines = sum(1 for l in lines if len(l) > 1)
     if multi_block_lines == 0 or (two_col_count / multi_block_lines) < 0.4:
         return lines
 
     logger.debug("Layout de duas colunas detectado.")
-
-    # Ponto de divisão: mediana horizontal
     midpoint = min(all_x_left) + page_width / 2
 
     left_col_lines: List[List[Dict]] = []
@@ -253,7 +258,6 @@ def _handle_columns(lines: List[List[Dict]], avg_height: float) -> List[List[Dic
     for line in lines:
         left_blocks = [b for b in line if b["x_left"] < midpoint]
         right_blocks = [b for b in line if b["x_left"] >= midpoint]
-
         if left_blocks:
             left_col_lines.append(left_blocks)
         if right_blocks:
@@ -265,11 +269,6 @@ def _handle_columns(lines: List[List[Dict]], avg_height: float) -> List[List[Dic
 def _group_into_paragraphs(
     lines: List[List[Dict]], avg_height: float
 ) -> List[List[List[Dict]]]:
-    """
-    Agrupa linhas em parágrafos baseado no espaçamento vertical.
-
-    Um gap vertical maior que 1.5 × altura média sinaliza uma nova seção/parágrafo.
-    """
     if not lines:
         return []
 
@@ -293,7 +292,6 @@ def _group_into_paragraphs(
 
 
 def _render_paragraphs(paragraphs: List[List[List[Dict]]]) -> str:
-    """Converte parágrafos em texto, separados por linha em branco."""
     rendered = []
     for para in paragraphs:
         lines_text = []

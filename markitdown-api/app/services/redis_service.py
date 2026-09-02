@@ -1,6 +1,8 @@
 import asyncio
 import gzip
+import json
 import logging
+from typing import List, Optional
 
 import redis.asyncio as aioredis
 
@@ -17,7 +19,6 @@ async def get_redis() -> aioredis.Redis:
     if _redis is None:
         async with _redis_lock:
             if _redis is None:
-                # decode_responses=False para suportar bytes comprimidos (gzip)
                 _redis = aioredis.from_url(
                     settings.REDIS_URL,
                     decode_responses=False,
@@ -39,19 +40,20 @@ async def get_status(doc_id: str) -> str | None:
     return val.decode() if val else None
 
 
-async def save_markdown(doc_id: str, markdown: str) -> None:
+async def save_pages(doc_id: str, pages: List) -> None:
+    """Persiste a lista de páginas como JSON comprimido."""
     r = await get_redis()
-    compressed = gzip.compress(markdown.encode("utf-8"))
-    await r.set(doc_id, compressed, ex=settings.REDIS_TTL)
+    compressed = gzip.compress(json.dumps(pages, ensure_ascii=False).encode("utf-8"))
+    await r.set(f"{doc_id}:pages", compressed, ex=settings.REDIS_TTL)
     logger.info(
-        "Markdown salvo no Redis: id=%s original=%dB comprimido=%dB ttl=%ds",
-        doc_id, len(markdown), len(compressed), settings.REDIS_TTL,
+        "Páginas salvas no Redis: id=%s páginas=%d comprimido=%dB",
+        doc_id, len(pages), len(compressed),
     )
 
 
-async def get_markdown(doc_id: str) -> str | None:
+async def get_pages(doc_id: str) -> Optional[List]:
     r = await get_redis()
-    compressed = await r.get(doc_id)
+    compressed = await r.get(f"{doc_id}:pages")
     if compressed is None:
         return None
-    return gzip.decompress(compressed).decode("utf-8")
+    return json.loads(gzip.decompress(compressed).decode("utf-8"))
