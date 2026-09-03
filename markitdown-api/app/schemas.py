@@ -64,6 +64,26 @@ class PageResult(BaseModel):
     }
 
 
+class StatusResponse(BaseModel):
+    id: str = Field(description="UUID do documento.")
+    status: Literal["processing", "done", "error"] = Field(
+        description=(
+            "'processing' → ainda em andamento; "
+            "'done' → concluído; "
+            "'error' → falha no processamento."
+        )
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "id": "bd22c47e-fb79-4aa4-9cf1-589423f8d653",
+                "status": "processing",
+            }
+        }
+    }
+
+
 class ResultResponse(BaseModel):
     id: str = Field(description="UUID do documento.")
     status: Literal["processing", "done", "error"] = Field(

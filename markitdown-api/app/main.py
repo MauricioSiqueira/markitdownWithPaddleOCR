@@ -9,7 +9,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.auth import verify_api_key
-from app.schemas import ConvertRequest, ConvertResponse, HealthResponse, ResultResponse
+from app.schemas import ConvertRequest, ConvertResponse, HealthResponse, ResultResponse, StatusResponse
 from app.services.markitdown_service import prepare_from_uri, process_document
 from app.services.metrics import (
     document_processing_seconds,
@@ -37,6 +37,8 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if path.startswith("/result/"):
             path = "/result/{doc_id}"
+        elif path.startswith("/status/"):
+            path = "/status/{doc_id}"
 
         http_requests_total.labels(
             method=request.method,
@@ -177,6 +179,35 @@ async def convert(
     background_tasks.add_task(_process_and_store, doc_id, temp_path, ext)
 
     return {"id": doc_id, "status": "processing"}
+
+
+@app.get(
+    "/status/{doc_id}",
+    tags=["Conversão"],
+    summary="Consultar status da conversão",
+    response_model=StatusResponse,
+    responses={
+        200: {"description": "Status atual do documento (processing, done ou error)."},
+        401: {"description": "API Key não informada."},
+        403: {"description": "API Key inválida."},
+        404: {"description": "ID não encontrado ou resultado expirado (TTL esgotado)."},
+    },
+)
+async def get_document_status(
+    doc_id: str,
+    _: str = Depends(verify_api_key),
+):
+    """
+    Retorna apenas o status do documento, sem o conteúdo convertido.
+
+    Use `GET /result/{id}` quando quiser recuperar o Markdown junto ao status.
+    """
+    status = await get_status(doc_id)
+
+    if status is None:
+        raise HTTPException(status_code=404, detail="Documento não encontrado ou expirado.")
+
+    return {"id": doc_id, "status": status}
 
 
 @app.get(
