@@ -10,6 +10,7 @@ Utiliza [Microsoft MarkItDown](https://github.com/microsoft/markitdown) para doc
 - PDFs híbridos: páginas com texto usam MarkItDown, páginas escaneadas usam OCR automaticamente
 - Recebe a URI do arquivo hospedado na Azure Blob Storage — sem upload direto
 - Processamento assíncrono em background — a rota retorna imediatamente
+- Consulta de status isolada (`GET /status/{id}`), sem o custo de trafegar o conteúdo
 - Resultado estruturado por página com ruídos OCR identificados
 - Autenticação por API Key
 - Validação de MIME type real do arquivo (python-magic)
@@ -131,6 +132,30 @@ Use o `id` retornado para consultar o resultado.
 | `403` | API Key inválida |
 | `413` | Arquivo maior que 500 MB |
 | `422` | Body inválido (ex.: `uri` não é uma URL válida) |
+
+---
+
+### `GET /status/{id}`
+
+Consulta apenas o status da conversão (sem o conteúdo). Útil para polling leve enquanto o documento ainda está `processing`.
+
+```bash
+curl "http://localhost:8000/status/bd22c47e-fb79-4aa4-9cf1-589423f8d653?api_key=nJHU7QG6PuD8qwwkvWO0KgDLH7FUcltPu9L3a0mwJJQ"
+```
+
+```json
+{"id": "bd22c47e-fb79-4aa4-9cf1-589423f8d653", "status": "processing"}
+```
+
+`status` pode ser `processing`, `done` ou `error`. Quando `done`, use `GET /result/{id}` para recuperar o Markdown.
+
+**Códigos de erro:**
+
+| Código | Motivo |
+|--------|--------|
+| `401` | API Key não informada |
+| `403` | API Key inválida |
+| `404` | ID não encontrado ou expirado (TTL esgotado) |
 
 ---
 
