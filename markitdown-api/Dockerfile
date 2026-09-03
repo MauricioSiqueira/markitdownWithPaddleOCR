@@ -5,18 +5,6 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Configuração padrão do OCR (sobreposta via docker run -e ou docker-compose)
-ENV OCR_ENABLED=true
-ENV OCR_LANGUAGE=pt
-ENV OCR_DPI=400
-ENV OCR_MIN_TEXT_LENGTH=30
-ENV OCR_MIN_IMAGE_RATIO=0.10
-ENV OCR_PREPROCESSING=true
-
-# Redis — sobrepor com a URL real via -e REDIS_URL=... ao rodar o container
-ENV REDIS_URL=redis://redis:6379
-ENV REDIS_TTL=86400
-
 # Dependências de sistema:
 #   libgl1, libglib2.0-0  → OpenCV (usado internamente pelo PaddleOCR)
 #   libgomp1              → OpenMP runtime exigido pelo PaddlePaddle

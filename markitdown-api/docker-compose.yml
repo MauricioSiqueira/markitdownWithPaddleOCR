@@ -3,15 +3,6 @@ services:
     build: .
     ports:
       - "8000:8000"
-    environment:
-      REDIS_URL: redis://redis:6379
-      REDIS_TTL: "86400"
-      OCR_ENABLED: "true"
-      OCR_LANGUAGE: pt
-      OCR_DPI: "400"
-      OCR_MIN_TEXT_LENGTH: "30"
-      OCR_MIN_IMAGE_RATIO: "0.10"
-      OCR_PREPROCESSING: "true"
     depends_on:
       redis:
         condition: service_healthy
