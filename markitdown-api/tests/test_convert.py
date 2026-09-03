@@ -1,5 +1,5 @@
 """
-Testes da API MarkItDown com Redis e background tasks.
+Testes da API MarkItDown.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,8 +9,8 @@ from app.main import app
 
 client = TestClient(app)
 
-DUMMY_PDF = b"%PDF-1.4 fake pdf content"
 VALID_API_KEY = "nJHU7QG6PuD8qwwkvWO0KgDLH7FUcltPu9L3a0mwJJQ"
+VALID_URI = "https://storage.blob.core.windows.net/docs/processo.pdf"
 
 DUMMY_PAGES = [
     {"page": 1, "markitdown": "Conteúdo da página 1.", "noises": []},
@@ -20,10 +20,11 @@ DUMMY_PAGES = [
 ]
 
 
-def _md_result(text: str) -> MagicMock:
-    result = MagicMock()
-    result.text_content = text
-    return result
+def _post_convert(uri: str = VALID_URI, api_key: str = VALID_API_KEY):
+    return client.post(
+        f"/convert?api_key={api_key}",
+        json={"uri": uri},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -43,18 +44,12 @@ def test_health():
 
 
 def test_sem_api_key_retorna_401():
-    response = client.post(
-        "/convert",
-        files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
-    )
+    response = client.post("/convert", json={"uri": VALID_URI})
     assert response.status_code == 401
 
 
 def test_api_key_invalida_retorna_403():
-    response = client.post(
-        "/convert?api_key=chave-errada",
-        files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
-    )
+    response = _post_convert(api_key="chave-errada")
     assert response.status_code == 403
 
 
@@ -69,14 +64,12 @@ def test_get_result_sem_api_key_retorna_401():
 
 
 def test_convert_pdf_retorna_id_e_status_processing():
-    with patch("app.main.save_status", new_callable=AsyncMock), \
+    with patch("app.main.prepare_from_uri", new_callable=AsyncMock, return_value=("/tmp/doc.pdf", ".pdf")), \
+         patch("app.main.save_status", new_callable=AsyncMock), \
          patch("app.main.save_pages", new_callable=AsyncMock), \
          patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES):
 
-        response = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
-        )
+        response = _post_convert()
 
         assert response.status_code == 202
         body = response.json()
@@ -85,62 +78,48 @@ def test_convert_pdf_retorna_id_e_status_processing():
         assert body["status"] == "processing"
 
 
-def test_convert_pdf_escaneado_retorna_id():
-    with patch("app.main.save_status", new_callable=AsyncMock), \
-         patch("app.main.save_pages", new_callable=AsyncMock), \
-         patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES):
-
-        response = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("scan.pdf", DUMMY_PDF, "application/pdf")},
-        )
-
-        assert response.status_code == 202
-        assert response.json()["status"] == "processing"
+def test_convert_uri_invalida_retorna_422():
+    response = _post_convert(uri="nao-é-uma-uri")
+    assert response.status_code == 422
 
 
 def test_convert_formato_invalido_retorna_400():
-    response = client.post(
-        f"/convert?api_key={VALID_API_KEY}",
-        files={"file": ("img.jpg", b"fake", "image/jpeg")},
-    )
+    with patch(
+        "app.main.prepare_from_uri",
+        new_callable=AsyncMock,
+        side_effect=__import__("fastapi").HTTPException(
+            status_code=400,
+            detail="Formato não suportado: '.jpg'.",
+        ),
+    ):
+        response = _post_convert(uri="https://storage.blob.core.windows.net/docs/foto.jpg")
     assert response.status_code == 400
     assert "Formato não suportado" in response.json()["detail"]
 
 
-def test_arquivo_com_extensao_valida_mas_conteudo_invalido_retorna_400():
-    with patch("app.services.markitdown_service._validate_mime", return_value=False):
-        response = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("malicioso.pdf", b"isto nao e um pdf", "application/pdf")},
-        )
+def test_convert_uri_inacessivel_retorna_400():
+    with patch(
+        "app.main.prepare_from_uri",
+        new_callable=AsyncMock,
+        side_effect=__import__("fastapi").HTTPException(
+            status_code=400,
+            detail="Não foi possível baixar o arquivo da URI (HTTP 403).",
+        ),
+    ):
+        response = _post_convert()
     assert response.status_code == 400
-    assert "não corresponde" in response.json()["detail"]
 
 
-def test_arquivo_com_mime_valido_e_aceito():
-    with patch("app.main.save_status", new_callable=AsyncMock), \
-         patch("app.main.save_pages", new_callable=AsyncMock), \
-         patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES), \
-         patch("app.services.markitdown_service._validate_mime", return_value=True):
-        response = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("doc.pdf", b"%PDF-1.4 conteudo fake", "application/pdf")},
-        )
-    assert response.status_code == 202
-
-
-def test_arquivo_maior_que_500mb_retorna_413():
-    from fastapi import HTTPException as _HTTPException
-    with patch("app.services.markitdown_service._read_chunked", new_callable=AsyncMock) as mock_read:
-        mock_read.side_effect = _HTTPException(
+def test_convert_arquivo_grande_retorna_413():
+    with patch(
+        "app.main.prepare_from_uri",
+        new_callable=AsyncMock,
+        side_effect=__import__("fastapi").HTTPException(
             status_code=413,
             detail="O arquivo excedeu o limite de tamanho permitido (500 MB).",
-        )
-        response = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("grande.pdf", b"%PDF-1.4 fake", "application/pdf")},
-        )
+        ),
+    ):
+        response = _post_convert()
     assert response.status_code == 413
     assert "500 MB" in response.json()["detail"]
 
@@ -151,14 +130,12 @@ def test_convert_erro_no_processamento_salva_status_error():
     async def capture_status(doc_id: str, status: str) -> None:
         saved_statuses.append((doc_id, status))
 
-    with patch("app.main.save_status", side_effect=capture_status), \
+    with patch("app.main.prepare_from_uri", new_callable=AsyncMock, return_value=("/tmp/doc.pdf", ".pdf")), \
+         patch("app.main.save_status", side_effect=capture_status), \
          patch("app.main.save_pages", new_callable=AsyncMock), \
          patch("app.services.markitdown_service.process_pdf", side_effect=Exception("falha simulada")):
 
-        response = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("doc.pdf", DUMMY_PDF, "application/pdf")},
-        )
+        response = _post_convert()
 
     assert response.status_code == 202
     statuses = [s for _, s in saved_statuses]
@@ -224,13 +201,11 @@ def test_fluxo_completo_convert_e_recupera():
     async def fake_save_status(doc_id: str, status: str) -> None:
         pass
 
-    with patch("app.main.save_pages", side_effect=fake_save_pages), \
+    with patch("app.main.prepare_from_uri", new_callable=AsyncMock, return_value=("/tmp/portaria.pdf", ".pdf")), \
+         patch("app.main.save_pages", side_effect=fake_save_pages), \
          patch("app.main.save_status", side_effect=fake_save_status), \
          patch("app.services.markitdown_service.process_pdf", return_value=DUMMY_PAGES):
-        r1 = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("portaria.pdf", DUMMY_PDF, "application/pdf")},
-        )
+        r1 = _post_convert()
         assert r1.status_code == 202
         doc_id = r1.json()["id"]
         assert r1.json()["status"] == "processing"
@@ -253,13 +228,11 @@ def test_pdf_preserva_caracteres_portugueses():
     texto_pt = "Portaria nº 123/2024 — Seção de Administração do órgão público; critérios específicos."
     pages_pt = [{"page": 1, "markitdown": texto_pt, "noises": []}]
 
-    with patch("app.main.save_status", new_callable=AsyncMock), \
+    with patch("app.main.prepare_from_uri", new_callable=AsyncMock, return_value=("/tmp/portaria.pdf", ".pdf")), \
+         patch("app.main.save_status", new_callable=AsyncMock), \
          patch("app.main.save_pages", new_callable=AsyncMock), \
          patch("app.services.markitdown_service.process_pdf", return_value=pages_pt):
-        r1 = client.post(
-            f"/convert?api_key={VALID_API_KEY}",
-            files={"file": ("portaria.pdf", DUMMY_PDF, "application/pdf")},
-        )
+        r1 = _post_convert()
         doc_id = r1.json()["id"]
 
     with patch("app.main.get_status", new_callable=AsyncMock, return_value="done"), \
@@ -271,6 +244,19 @@ def test_pdf_preserva_caracteres_portugueses():
         assert "ç" in body
         assert "é" in body
         assert "ó" in body
+
+
+# ---------------------------------------------------------------------------
+# Testes unitários: markitdown_service._ext_from_uri
+# ---------------------------------------------------------------------------
+
+
+def test_ext_from_uri_extrai_corretamente():
+    from app.services.markitdown_service import _ext_from_uri
+
+    assert _ext_from_uri("https://storage.blob.core.windows.net/docs/proc.pdf?sv=2023") == ".pdf"
+    assert _ext_from_uri("https://host/path/to/file.docx") == ".docx"
+    assert _ext_from_uri("https://host/ARQUIVO.PPTX") == ".pptx"
 
 
 # ---------------------------------------------------------------------------

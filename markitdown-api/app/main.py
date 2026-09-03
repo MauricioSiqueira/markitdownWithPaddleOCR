@@ -3,14 +3,14 @@ import os
 import time
 import uuid
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.auth import verify_api_key
-from app.schemas import ConvertResponse, HealthResponse, ResultResponse
-from app.services.markitdown_service import prepare_upload, process_document
+from app.schemas import ConvertRequest, ConvertResponse, HealthResponse, ResultResponse
+from app.services.markitdown_service import prepare_from_uri, process_document
 from app.services.metrics import (
     document_processing_seconds,
     documents_completed_total,
@@ -148,27 +148,27 @@ async def metrics():
     response_model=ConvertResponse,
     status_code=202,
     responses={
-        400: {"description": "Formato de arquivo inválido ou conteúdo não corresponde à extensão."},
+        400: {"description": "URI inacessível, formato inválido ou conteúdo não corresponde à extensão."},
         401: {"description": "API Key não informada."},
         403: {"description": "API Key inválida."},
         413: {"description": "Arquivo maior que 500 MB."},
     },
 )
 async def convert(
+    body: ConvertRequest,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="Arquivo a converter. Formatos aceitos: .pdf, .docx, .pptx, .xlsx, .xls"),
     _: str = Depends(verify_api_key),
 ):
     """
-    Envia um documento para conversão assíncrona.
+    Recebe a URI de um documento hospedado na Azure, baixa e inicia a conversão assíncrona.
 
-    O arquivo é validado (extensão + MIME type real) e lido antes de retornar.
-    A conversão em si ocorre em background — use `GET /result/{id}` para
-    acompanhar o andamento e recuperar o Markdown quando concluído.
+    A URI deve apontar para um arquivo com extensão suportada (.pdf, .docx, .pptx, .xlsx, .xls).
+    O download e a validação ocorrem antes de retornar; a conversão em si ocorre em background.
+    Use `GET /result/{id}` para acompanhar o andamento e recuperar o Markdown quando concluído.
 
     **Limite:** 500 MB por arquivo.
     """
-    temp_path, ext = await prepare_upload(file)
+    temp_path, ext = await prepare_from_uri(str(body.uri))
 
     doc_id = str(uuid.uuid4())
     await save_status(doc_id, "processing")

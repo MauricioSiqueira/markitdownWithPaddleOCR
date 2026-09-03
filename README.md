@@ -8,9 +8,10 @@ Utiliza [Microsoft MarkItDown](https://github.com/microsoft/markitdown) para doc
 
 - Conversão de `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.xls` para Markdown
 - PDFs híbridos: páginas com texto usam MarkItDown, páginas escaneadas usam OCR automaticamente
+- Recebe a URI do arquivo hospedado na Azure Blob Storage — sem upload direto
 - Processamento assíncrono em background — a rota retorna imediatamente
+- Resultado estruturado por página com ruídos OCR identificados
 - Autenticação por API Key
-- Rate limiting por IP (10 req/min)
 - Validação de MIME type real do arquivo (python-magic)
 - Limite de tamanho: 500 MB por arquivo
 - Compressão gzip dos resultados no Redis
@@ -101,11 +102,18 @@ curl http://localhost:8000/health
 
 ### `POST /convert`
 
-Envia um documento para conversão. Retorna imediatamente com um ID e status `processing`.
+Recebe a URI de um documento hospedado na Azure Blob Storage, baixa e inicia a conversão em background. Retorna imediatamente com um ID e status `processing`.
+
+**Body (JSON):**
+
+| Campo | Tipo   | Descrição |
+|-------|--------|-----------|
+| `uri` | string | URI do arquivo na Azure (com SAS token se necessário) |
 
 ```bash
 curl -X POST "http://localhost:8000/convert?api_key=nJHU7QG6PuD8qwwkvWO0KgDLH7FUcltPu9L3a0mwJJQ" \
-  -F "file=@/caminho/para/documento.pdf"
+  -H "Content-Type: application/json" \
+  -d '{"uri": "https://minhaconta.blob.core.windows.net/documentos/processo.pdf?sv=2023-01-03&se=..."}'
 ```
 
 ```json
@@ -113,6 +121,16 @@ curl -X POST "http://localhost:8000/convert?api_key=nJHU7QG6PuD8qwwkvWO0KgDLH7FU
 ```
 
 Use o `id` retornado para consultar o resultado.
+
+**Códigos de erro:**
+
+| Código | Motivo |
+|--------|--------|
+| `400` | URI inacessível, formato não suportado ou conteúdo não corresponde à extensão |
+| `401` | API Key não informada |
+| `403` | API Key inválida |
+| `413` | Arquivo maior que 500 MB |
+| `422` | Body inválido (ex.: `uri` não é uma URL válida) |
 
 ---
 
@@ -133,8 +151,27 @@ Possíveis respostas:
 
 **Concluído:**
 ```json
-{"id": "...", "status": "done", "markdown": "# Título\n\nConteúdo..."}
+{
+  "id": "...",
+  "status": "done",
+  "pages": [
+    {
+      "page": 1,
+      "markitdown": "# Processo nº 1234/2026\n\nAuto de Infração...",
+      "noises": []
+    },
+    {
+      "page": 2,
+      "markitdown": "Conforme estabelecido no Art. 5º...",
+      "noises": [
+        {"page": 2, "text": "rmorl", "confidence": 0.54, "reason": "low_confidence"}
+      ]
+    }
+  ]
+}
 ```
+
+O campo `noises` por página lista tokens que o OCR não reconheceu com confiança suficiente (`low_confidence`, threshold 0.75) ou que foram descartados por serem lixo (`garbage_pattern`). Permite metrificar a acertividade do OCR por documento.
 
 **Erro no processamento:**
 ```json
@@ -163,7 +200,7 @@ Métricas disponíveis:
 | `documents_in_progress` | Gauge | Conversões em andamento agora |
 | `document_processing_seconds` | Histogram | Duração de conversão por extensão |
 | `documents_completed_total` | Counter | Total concluídos por status e extensão |
-| `documents_submitted_total` | Counter | Total de uploads por extensão |
+| `documents_submitted_total` | Counter | Total de envios por extensão |
 | `http_request_duration_seconds` | Histogram | Latência das rotas |
 | `http_requests_total` | Counter | Requisições por endpoint e status HTTP |
 | `process_resident_memory_bytes` | Gauge | RAM do processo |
@@ -174,10 +211,12 @@ Métricas disponíveis:
 ## Fluxo completo em um comando
 
 ```bash
-# 1. Envia o documento e captura o ID
+# 1. Envia a URI e captura o ID
 ID=$(curl -s -X POST \
   "http://localhost:8000/convert?api_key=nJHU7QG6PuD8qwwkvWO0KgDLH7FUcltPu9L3a0mwJJQ" \
-  -F "file=@documento.pdf" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  -H "Content-Type: application/json" \
+  -d '{"uri": "https://minhaconta.blob.core.windows.net/docs/processo.pdf?sv=..."}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
 echo "ID: $ID"
 
@@ -195,7 +234,8 @@ curl "http://localhost:8000/result/$ID?api_key=nJHU7QG6PuD8qwwkvWO0KgDLH7FUcltPu
 | `REDIS_TTL` | `86400` | Expiração do resultado em segundos (24h) |
 | `OCR_ENABLED` | `true` | Habilita OCR para páginas escaneadas |
 | `OCR_LANGUAGE` | `pt` | Idioma do OCR |
-| `OCR_DPI` | `300` | Resolução de renderização para OCR |
+| `OCR_DPI` | `400` | Resolução de renderização para OCR |
+| `OCR_CONFIDENCE_THRESHOLD` | `0.75` | Confiança mínima do OCR; abaixo disso o token vai para `noises` |
 | `OCR_MIN_TEXT_LENGTH` | `30` | Mínimo de caracteres para considerar página como texto nativo |
 | `OCR_MIN_IMAGE_RATIO` | `0.10` | Proporção mínima de área de imagem para acionar OCR |
 | `OCR_PREPROCESSING` | `true` | Pré-processamento de imagem antes do OCR |

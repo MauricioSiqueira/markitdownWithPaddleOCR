@@ -1,5 +1,19 @@
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AnyHttpUrl
+
+
+class ConvertRequest(BaseModel):
+    uri: AnyHttpUrl = Field(
+        description="URI do arquivo hospedado na Azure (Blob Storage). O formato deve ser suportado: .pdf, .docx, .pptx, .xlsx, .xls.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "uri": "https://minhaconta.blob.core.windows.net/documentos/processo.pdf?sv=2023-01-03&se=...",
+            }
+        }
+    }
 
 
 class HealthResponse(BaseModel):
