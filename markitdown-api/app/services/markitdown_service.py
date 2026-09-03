@@ -9,9 +9,7 @@ Formatos suportados: .pdf, .docx, .pptx, .xlsx, .xls
 """
 import asyncio
 import logging
-import os
 import tempfile
-from urllib.parse import urlparse
 
 import httpx
 import magic
@@ -37,32 +35,26 @@ _ALLOWED_MIMES: dict[str, set[str]] = {
     ".xls":  {"application/vnd.ms-excel"},
 }
 
+# Mapa reverso: MIME → extensão
+_MIME_TO_EXT: dict[str, str] = {
+    mime: ext
+    for ext, mimes in _ALLOWED_MIMES.items()
+    for mime in mimes
+}
 
-def _validate_mime(ext: str, content: bytes) -> bool:
-    detected = magic.from_buffer(content[:2048], mime=True)
-    return detected in _ALLOWED_MIMES.get(ext, set())
 
-
-def _ext_from_uri(uri: str) -> str:
-    """Extrai a extensão do path da URI, ignorando query string."""
-    path = urlparse(uri).path
-    return os.path.splitext(path)[1].lower()
+def _ext_from_content(content: bytes) -> str:
+    """Detecta a extensão inspecionando o conteúdo real do arquivo. Retorna '' se não suportado."""
+    mime = magic.from_buffer(content[:2048], mime=True)
+    return _MIME_TO_EXT.get(mime, "")
 
 
 async def prepare_from_uri(uri: str) -> tuple[str, str]:
     """
-    Baixa o arquivo da URI, valida (extensão + MIME) e salva em disco.
-    Retorna (temp_path, ext).
+    Baixa o arquivo da URI e salva em disco. Retorna (temp_path, ext).
+    O formato é detectado pelo conteúdo real do arquivo (python-magic).
     O chamador é responsável por remover temp_path após o processamento.
     """
-    ext = _ext_from_uri(uri)
-
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Formato não suportado: '{ext}'. Formatos permitidos: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
-        )
-
     chunks: list[bytes] = []
     total = 0
 
@@ -92,10 +84,14 @@ async def prepare_from_uri(uri: str) -> tuple[str, str]:
 
     content = b"".join(chunks)
 
-    if not _validate_mime(ext, content):
+    ext = _ext_from_content(content)
+    if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="O conteúdo do arquivo não corresponde ao formato declarado pela URI.",
+            detail=(
+                "Formato de arquivo não suportado. "
+                f"Formatos permitidos: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            ),
         )
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:

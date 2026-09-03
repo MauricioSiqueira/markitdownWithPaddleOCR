@@ -251,12 +251,19 @@ def test_pdf_preserva_caracteres_portugueses():
 # ---------------------------------------------------------------------------
 
 
-def test_ext_from_uri_extrai_corretamente():
-    from app.services.markitdown_service import _ext_from_uri
+def test_ext_from_content_pdf():
+    from app.services.markitdown_service import _ext_from_content
 
-    assert _ext_from_uri("https://storage.blob.core.windows.net/docs/proc.pdf?sv=2023") == ".pdf"
-    assert _ext_from_uri("https://host/path/to/file.docx") == ".docx"
-    assert _ext_from_uri("https://host/ARQUIVO.PPTX") == ".pptx"
+    # Cabeçalho mágico de um PDF real
+    pdf_header = b"%PDF-1.4 fake content to fill the buffer for magic detection" + b"\x00" * 100
+    # python-magic detecta 'application/pdf' pelo %PDF
+    assert _ext_from_content(pdf_header) == ".pdf"
+
+
+def test_ext_from_content_desconhecido():
+    from app.services.markitdown_service import _ext_from_content
+
+    assert _ext_from_content(b"isso nao e um arquivo suportado") == ""
 
 
 # ---------------------------------------------------------------------------
